@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import json
 import re
 import secrets
 import traceback
@@ -28,7 +29,7 @@ class FidMonths(Enum):
     Dec = 12
 
 
-class FidelityAutomation:  # NOQA: PLR0904
+class FidelityAutomation:
     """A class to manage and control a zendriver webdriver with Fidelity.
 
     Uses zendriver (CDP-based) instead of Selenium for better anti-detection.
@@ -43,7 +44,7 @@ class FidelityAutomation:  # NOQA: PLR0904
 
     """
 
-    def __init__(  # NOQA: PLR0913
+    def __init__(  # ruff: ignore[too-many-arguments]
         self,
         *,  # Enforce keyword arguments
         headless: bool = True,
@@ -186,22 +187,32 @@ class FidelityAutomation:  # NOQA: PLR0904
             # Wait for the "From" dropdown to be available
             await asyncio.sleep(1)
 
-            # Find the "From" select element
-            # In zendriver, use tab.select() to query DOM with CSS selectors
-            from_select = await self.page.select("select[aria-label='From'], select[name='from_account']")
-
-            if not from_select:
+            # pvd-select is a web component whose inner <select> lives in shadow DOM;
+            # read options directly from the pvd-options JSON attribute instead
+            pvd_select = await self.page.query_selector("pvd-select[pvd-id='From-acct-select']")
+            if not pvd_select:
                 print("Could not find 'From' dropdown")
                 return self.account_dict
 
-            # Get all option elements
-            options = await from_select.select_all("option")
+            options_json = await pvd_select.attr("pvd-options")
+            if not options_json:
+                print("Could not read options from 'From' dropdown")
+                return self.account_dict
+
+            # Flatten option groups into [{value, text}, ...]
+            raw_options = json.loads(options_json)
+            flat_options = []
+            for item in raw_options:
+                if "options" in item:
+                    flat_options.extend(item["options"])
+                elif item.get("value"):
+                    flat_options.append(item)
 
             local_dict = {}
 
-            # Get account number and nickname from each option
-            for option in options:
-                option_text = await option.text
+            for opt in flat_options:
+                option_text = opt.get("text", "")
+                option_value = opt.get("value", "")
 
                 # Try to find accounts using regex
                 account_number = re.search(r"(?<=\()(Z|\d)\d{6,}(?=\))", option_text)
@@ -210,21 +221,24 @@ class FidelityAutomation:  # NOQA: PLR0904
 
                 # Get withdrawal balance if requested
                 if get_withdrawal_bal and account_number and nickname:
-                    # Get the option's value attribute
-                    option_value = await option.attr("value")
-
-                    # Select this option
-                    select_elem = await self.page.select("select[aria-label='From']")
-                    await select_elem.evaluate(f"el => el.value = '{option_value}'")
-
-                    # Trigger change event
-                    await select_elem.evaluate("el => el.dispatchEvent(new Event('change', {{ bubbles: true }}))")
+                    # Set value on inner <select> via shadow root and fire change event
+                    await pvd_select.evaluate(f"""
+                        (el) => {{
+                            const s = el.shadowRoot
+                                ? el.shadowRoot.querySelector('select')
+                                : el.querySelector('select');
+                            if (s) {{
+                                s.value = '{option_value}';
+                                s.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            }}
+                        }}
+                    """)
 
                     # Wait for balance to update
                     await asyncio.sleep(0.5)
 
                     # Find the balance element
-                    balance_elem = await self.page.select("tr.pvd-table__row:nth-child(2) > td:nth-child(2)")
+                    balance_elem = await self.page.query_selector("tr.pvd-table__row:nth-child(2) > td:nth-child(2)")
                     if balance_elem:
                         bal_text = await balance_elem.text
                         with_bal = float(bal_text.replace("$", "").replace(",", ""))
@@ -304,7 +318,7 @@ class FidelityAutomation:  # NOQA: PLR0904
         }
         return True
 
-    async def login(  # NOQA: PLR0911
+    async def login(
         self,
         username: str,
         password: str,
@@ -333,7 +347,7 @@ class FidelityAutomation:  # NOQA: PLR0904
         """
         try:
             # Navigate to login page
-            await self.navigate("https://digital.fidelity.com/prgw/digital/login/full-page")
+            await self.navigate("https://digital.fidelity.com/prgw/digital/signin/retail")
             await asyncio.sleep(1)
 
             # Enter username
@@ -372,7 +386,7 @@ class FidelityAutomation:  # NOQA: PLR0904
                 return (True, True)
 
             # Check if we're at 2FA page
-            if "login" in current_url:
+            if "signin" in current_url:
                 await self.page.wait_for_ready_state("complete")
 
                 # Handle TOTP if provided
@@ -381,30 +395,50 @@ class FidelityAutomation:  # NOQA: PLR0904
                     totp_code = totp.now()
 
                     # Look for authenticator code input
-                    totp_field = await self.page.find("input[placeholder='XXXXXX']")
+                    totp_field = await self.page.query_selector("input[placeholder='XXXXXX']")
                     if totp_field:
-                        await totp_field.send_keys(totp_code)
+                        for number in totp_code:
+                            await totp_field.send_keys(number)
+                            await self.page.sleep(secrets.SystemRandom().uniform(0.05, 0.50))
 
-                        # Check "don't ask again" if save_device is True
-                        if save_device:
-                            dont_ask_label = await self.page.find("Don't ask me again", best_match=True)
+                    # Check "don't ask again" if save_device is True
+                    if save_device:
+                        try:
+                            dont_ask_label = await self.page.find_element_by_text("Don't ask me again", best_match=True)
                             if dont_ask_label:
-                                await dont_ask_label.mouse_click()
+                                await dont_ask_label.click()
+                        except Exception as e:
+                            print(f"Error handling 'Don't ask me again' and 'Remember this device': {e}")
+                        try:
+                            remember_checkbox = await self.page.find_element_by_text("Remember this device", best_match=True)
+                            if remember_checkbox:
+                                pos = await remember_checkbox.get_position()
+                                if pos:
+                                    # Click near left edge where the checkbox input sits, not the label center
+                                    await self.page.mouse_click(pos.left + 5, pos.center[1])
+                        except Exception as e:
+                            print(f"Error handling 'Remember this device': {e}")
 
-                        # Submit 2FA code
-                        continue_btn = await self.page.find("Continue", best_match=True)
+                    # Submit 2FA code
+                    try:
+                        continue_btn = await self.page.find_element_by_text("Continue", best_match=True)
                         if continue_btn:
                             await continue_btn.mouse_click()
-                            await self.page.wait_for_ready_state("complete")
-
+                            await asyncio.sleep(3)
                             final_url = self.page.url
+                            print(final_url)
+                            input()
                             if "summary" in final_url:
+                                print("here")
                                 if self.debug:
                                     print("✓ TOTP login successful")
                                 return (True, True)
+                    except Exception as e:
+                        print(f"Error submitting TOTP code: {e}")
+                        traceback.print_exc()
 
                 # If we need SMS code
-                text_btn = await self.page.find("button:has-text('Text me the code')")
+                text_btn = await self.page.find_element_by_text("Text me the code", best_match=True)
                 if text_btn:
                     await text_btn.mouse_click()
                     if self.debug:
@@ -419,7 +453,7 @@ class FidelityAutomation:  # NOQA: PLR0904
             traceback.print_exc()
             return (False, False)
 
-    async def login_2FA(self, code: str, *, save_device: bool = True) -> bool:  # NOQA: N802
+    async def login_2FA(self, code: str, *, save_device: bool = True) -> bool:  # ruff: ignore[invalid-function-name]
         """Complete the 2FA portion of login using SMS code.
 
         Args:
@@ -428,6 +462,7 @@ class FidelityAutomation:  # NOQA: PLR0904
 
         Returns:
             True if successful, False otherwise.
+
         """
         try:
             # Find the code input field
@@ -440,14 +475,14 @@ class FidelityAutomation:  # NOQA: PLR0904
 
             # Check "don't ask again" if requested
             if save_device:
-                dont_ask = await self.page.find("Don't ask me again", best_match=True)
+                dont_ask = await self.page.find_element_by_text("Don't ask me again", best_match=True)
                 if dont_ask:
-                    await dont_ask.mouse_click()
+                    await dont_ask.click()
 
             # Submit code
-            submit_btn = await self.page.find("Continue", best_match=True)
+            submit_btn = await self._find_button("Continue")
             if submit_btn:
-                await submit_btn.mouse_click()
+                await submit_btn.click()
 
             await self.page.wait_for_ready_state("complete")
 
@@ -492,7 +527,7 @@ class FidelityAutomation:  # NOQA: PLR0904
 
         return unique_stocks
 
-    async def transaction(  # NOQA: PLR0913
+    async def transaction(  # ruff: ignore[too-many-arguments]
         self,
         stock: str,
         quantity: float,
@@ -526,18 +561,18 @@ class FidelityAutomation:  # NOQA: PLR0904
             await self.page.wait_for_ready_state("complete")
 
             # Select account
-            account_dropdown = await self.page.find("#dest-acct-dropdown")
+            account_dropdown = await self.page.query_selector("#dest-acct-dropdown")
             if account_dropdown:
-                await account_dropdown.mouse_click()
+                await account_dropdown.click()
                 await asyncio.sleep(0.5)
 
                 # Find and click account option
                 # XPath can combine attribute and text conditions
-                xpath_expr = f"//button[@role='option' and contains(text(), '{account.upper()}')]"  
+                xpath_expr = f"//button[@role='option' and contains(text(), '{account.upper()}')]"
                 account_option = await self.page.xpath(xpath_expr)
                 if account_option:
                     account_option = account_option[0]  # xpath returns a list
-                    await account_option.mouse_click()
+                    await account_option.click()
                     await asyncio.sleep(1)
 
             # Enter symbol
@@ -550,10 +585,10 @@ class FidelityAutomation:  # NOQA: PLR0904
             # Select action (Buy/Sell)
             action_dropdown = await self.page.select(".eq-ticket-action-label")
             if action_dropdown:
-                await action_dropdown.mouse_click()
+                await action_dropdown.click()
                 action_option = await self.page.select(f"option[value='{action}']")
                 if action_option:
-                    await action_option.mouse_click()
+                    await action_option.click()
 
             # Enter quantity
             qty_field = await self.page.select("input[aria-label='Quantity']")
@@ -562,9 +597,9 @@ class FidelityAutomation:  # NOQA: PLR0904
 
             # Set order type
             if limit_price:
-                order_type = await self.page.find("Limit", best_match=True)
+                order_type = await self._find_button("Limit")
                 if order_type:
-                    await order_type.mouse_click()
+                    await order_type.click()
 
                     price_field = await self.page.select("input[aria-label='Limit Price']")
                     if price_field:
@@ -573,18 +608,18 @@ class FidelityAutomation:  # NOQA: PLR0904
             # Review order (or place if dry)
             if dry:
                 # Just test the order
-                preview_btn = await self.page.find("Preview Order", best_match=True)
+                preview_btn = await self._find_button("Preview Order")
                 if preview_btn:
-                    await preview_btn.mouse_click()
+                    await preview_btn.click()
                     await asyncio.sleep(1)
                     if self.debug:
                         print(f"✓ Test order preview: {action} {quantity} {stock}")
                     return (True, None)
             else:
                 # Place real order
-                submit_btn = await self.page.find("Submit Order", best_match=True)
+                submit_btn = await self._find_button("Submit Order")
                 if submit_btn:
-                    await submit_btn.mouse_click()
+                    await submit_btn.click()
                     await asyncio.sleep(2)
                     if self.debug:
                         print(f"✓ Order submitted: {action} {quantity} {stock}")
@@ -593,7 +628,7 @@ class FidelityAutomation:  # NOQA: PLR0904
             return (False, "Could not find submit button")
 
         except Exception as e:
-            error_msg = f"Transaction error: {str(e)}"
+            error_msg = f"Transaction error: {e!s}"
             print(error_msg)
             traceback.print_exc()
             return (False, error_msg)
@@ -640,9 +675,9 @@ class FidelityAutomation:  # NOQA: PLR0904
                 await amount_field.send_keys(str(transfer_amount))
 
             # Click transfer button
-            transfer_btn = await self.page.find("Transfer", best_match=True)
+            transfer_btn = await self._find_button("Transfer")
             if transfer_btn:
-                await transfer_btn.mouse_click()
+                await transfer_btn.click()
                 await asyncio.sleep(2)
                 if self.debug:
                     print(f"✓ Transferred ${transfer_amount} from {source_account} to {destination_account}")
@@ -673,13 +708,13 @@ class FidelityAutomation:  # NOQA: PLR0904
             # Look for penny stock trading option
             pennystock_checkbox = await self.page.select("input[aria-label*='penny']")
             if pennystock_checkbox:
-                await pennystock_checkbox.mouse_click()
+                await pennystock_checkbox.click()
                 await asyncio.sleep(1)
 
                 # Confirm
-                confirm_btn = await self.page.find("Enable", best_match=True)
+                confirm_btn = await self._find_button("Enable")
                 if confirm_btn:
-                    await confirm_btn.mouse_click()
+                    await confirm_btn.click()
                     await asyncio.sleep(2)
                     if self.debug:
                         print(f"✓ Penny stock trading enabled for {account}")
@@ -742,14 +777,14 @@ class FidelityAutomation:  # NOQA: PLR0904
             new_ui = True
             try:
                 # Try new UI
-                actions_btn = await self.page.find("Available Actions", best_match=True)
+                actions_btn = await self._find_button("Available Actions")
                 if actions_btn:
-                    await actions_btn.mouse_click()
-                    download_btn = await self.page.find("Download", best_match=True)
+                    await actions_btn.click()
+                    download_btn = await self._find_button("Download")
                     if download_btn:
                         # Start download and get the file
                         async with self.page.expect_download() as download_info:
-                            await download_btn.mouse_click()
+                            await download_btn.click()
                         download = await download_info
                     else:
                         new_ui = False
@@ -764,7 +799,7 @@ class FidelityAutomation:  # NOQA: PLR0904
                     download_btn = await self.page.select('*[aria-label="Download Positions"]', timeout=8000)
                     if download_btn:
                         async with self.page.expect_download() as download_info:
-                            await download_btn.mouse_click()
+                            await download_btn.click()
                         download = await download_info
                     else:
                         print("Could not get positions csv")
@@ -857,14 +892,14 @@ class FidelityAutomation:  # NOQA: PLR0904
                         "ticker": ticker,
                         "quantity": float(quantity),
                         "last_price": float(last_price),
-                        "value": float(cur_val)
+                        "value": float(cur_val),
                     }
 
                     # Try setting in the account dict without overwrite
                     if not self.set_account_dict(
                         account_num=row["Account Number"],
                         nickname=row["Account Name"],
-                        withdrawal_balance=0.0
+                        withdrawal_balance=0.0,
                     ):
                         # Account exists, just add the stock
                         self.add_stock_to_account_dict(row["Account Number"], stock_dict)
@@ -894,6 +929,7 @@ class FidelityAutomation:  # NOQA: PLR0904
 
         Returns:
             True if successful. For roth accounts, the number is stored in self.new_account_number.
+
         """
         try:
             if account_type.lower() == "roth":
@@ -901,16 +937,16 @@ class FidelityAutomation:  # NOQA: PLR0904
                 await self.wait_for_loading_sign()
 
                 # Click open account button
-                open_btn = await self.page.find("Open account", best_match=True)
+                open_btn = await self._find_button("Open account")
                 if open_btn:
-                    await open_btn.mouse_click()
+                    await open_btn.click()
                     await asyncio.sleep(3)
 
                 # Wait for congratulations message
                 await asyncio.sleep(2)
 
                 # Try to get account number from heading
-                congrats = await self.page.find("Congratulations", best_match=True)
+                congrats = await self.page.find_element_by_text("Congratulations", best_match=True)
                 if congrats:
                     if self.debug:
                         print("✓ Roth account opened successfully")
@@ -925,15 +961,15 @@ class FidelityAutomation:  # NOQA: PLR0904
 
                 # Click through the setup
                 for _ in range(3):
-                    next_btn = await self.page.find("Next", best_match=True)
+                    next_btn = await self._find_button("Next")
                     if next_btn:
-                        await next_btn.mouse_click()
+                        await next_btn.click()
                         await asyncio.sleep(1)
 
                 # Open account
-                open_btn = await self.page.find("Open account", best_match=True)
+                open_btn = await self._find_button("Open account")
                 if open_btn:
-                    await open_btn.mouse_click()
+                    await open_btn.click()
                     await asyncio.sleep(5)
 
                 # Get new account list and compare
@@ -980,15 +1016,15 @@ class FidelityAutomation:  # NOQA: PLR0904
             await asyncio.sleep(2)
 
             # Click date filter button
-            date_btn = await self.page.find("Changing", best_match=True)
+            date_btn = await self._find_button("Changing")
             if date_btn:
-                await date_btn.mouse_click()
+                await date_btn.click()
                 await asyncio.sleep(1)
 
                 # Select year
-                year_option = await self.page.find(f"{target_year}", best_match=True)
+                year_option = await self.page.find_element_by_text(f"{target_year}", best_match=True)
                 if year_option:
-                    await year_option.mouse_click()
+                    await year_option.click()
                     await asyncio.sleep(2)
 
             # Look for statements matching the month
@@ -998,7 +1034,7 @@ class FidelityAutomation:  # NOQA: PLR0904
             for row in statement_rows:
                 try:
                     row_text = await row.text
-                    if month_name in row_text and str(target_year) in row_text:  # NOQA: SIM102
+                    if month_name in row_text and str(target_year) in row_text:  # ruff: ignore[collapsible-if]
                         # Found a matching statement
                         # This would need to be enhanced to handle actual downloads
                         # For now just indicating the functionality
@@ -1025,6 +1061,7 @@ class FidelityAutomation:  # NOQA: PLR0904
 
         Returns:
             True if successful.
+
         """
         try:
             # Navigate to account settings
@@ -1045,9 +1082,9 @@ class FidelityAutomation:  # NOQA: PLR0904
                     await asyncio.sleep(0.5)
 
                     # Save
-                    save_btn = await self.page.find("Save", best_match=True)
+                    save_btn = await self._find_button("Save")
                     if save_btn:
-                        await save_btn.mouse_click()
+                        await save_btn.click()
                         await asyncio.sleep(2)
 
                         if self.debug:
