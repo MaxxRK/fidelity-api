@@ -1,7 +1,7 @@
 import asyncio
+import contextlib
 import csv
 import datetime
-import json
 import re
 import secrets
 import traceback
@@ -145,7 +145,12 @@ class FidelityAutomation:
 
     @staticmethod
     def _mask(value: str | None) -> str:
-        """Mask sensitive identifiers (e.g. account numbers) for logging privacy."""
+        """Mask sensitive identifiers (e.g. account numbers) for logging privacy.
+
+        Returns:
+            Masked string.
+
+        """
         if not value:
             return "***"
         val_str = str(value).strip()
@@ -155,7 +160,12 @@ class FidelityAutomation:
 
     @staticmethod
     def _clean_url(url: str | None) -> str:
-        """Sanitize URLs to strip query parameters or hashes that may divulge personal info."""
+        """Sanitize URLs to strip query parameters or hashes that may divulge personal info.
+
+        Returns:
+            Sanitized URL string.
+
+        """
         if not url:
             return ""
         return str(url).split("?")[0].split("#")[0]
@@ -163,7 +173,7 @@ class FidelityAutomation:
     def debug_log(self, msg: str) -> None:
         """Print timestamped debug messages when debug mode is enabled."""
         if self.debug:
-            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            timestamp = datetime.datetime.now(datetime.UTC).astimezone().strftime("%H:%M:%S")
             print(f"[{timestamp}] [DEBUG] {msg}")
 
     async def debug_screenshot(self, name: str, *, log_page_state: bool = True) -> str | None:
@@ -255,16 +265,16 @@ class FidelityAutomation:
         except Exception as e:
             self.debug_log(f"Error dumping DOM: {e}")
 
-    async def _find_button(self, text: str, timeout: float = 5.0) -> zd.Element | None:
-        """Find a button or clickable element containing the specified text."""
+    async def _find_button(self, text: str) -> zd.Element | None:
+        """Find a button or clickable element containing the specified text.
+
+        Returns:
+            The matched element or None.
+
+        """
         # 1. Try button/link/role='button'/role='menuitem' via xpath
         try:
-            xpath_expr = (
-                f"//button[contains(normalize-space(.), '{text}')] | "
-                f"//a[contains(normalize-space(.), '{text}')] | "
-                f"//*[@role='button' or @role='menuitem' or @role='option'][contains(normalize-space(.), '{text}')] | "
-                f"//input[@type='submit' or @type='button'][@value='{text}']"
-            )
+            xpath_expr = f"//button[contains(normalize-space(.), '{text}')] | //a[contains(normalize-space(.), '{text}')] | //*[@role='button' or @role='menuitem' or @role='option'][contains(normalize-space(.), '{text}')] | //input[@type='submit' or @type='button'][@value='{text}']"
             elems = await self.page.xpath(xpath_expr)
             if elems:
                 return elems[0]
@@ -273,10 +283,7 @@ class FidelityAutomation:
 
         # 2. Try case-insensitive xpath
         try:
-            xpath_expr = (
-                f"//*[self::button or self::a or @role='button' or @role='menuitem' or @role='option']"
-                f"[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text.lower()}')]"
-            )
+            xpath_expr = f"//*[self::button or self::a or @role='button' or @role='menuitem' or @role='option'][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text.lower()}')]"
             elems = await self.page.xpath(xpath_expr)
             if elems:
                 return elems[0]
@@ -288,8 +295,8 @@ class FidelityAutomation:
             elems = await self.page.find_elements_by_text(text)
             if elems:
                 for el in elems:
-                    tag = getattr(el, 'tag_name', '') or getattr(el, 'local_name', '') or ''
-                    if tag.lower() not in ('style', 'script', 'head', 'meta', 'link'):
+                    tag = getattr(el, "tag_name", "") or getattr(el, "local_name", "") or ""
+                    if tag.lower() not in {"style", "script", "head", "meta", "link"}:
                         return el
         except Exception:
             pass
@@ -297,7 +304,12 @@ class FidelityAutomation:
         return None
 
     async def _mouse_click(self, elem: zd.Element | None) -> bool:
-        """Click an element using native CDP mouse_click with realistic human movement for anti-detection."""
+        """Click an element using native CDP mouse_click with realistic human movement for anti-detection.
+
+        Returns:
+            True if click succeeded, False otherwise.
+
+        """
         if not elem:
             return False
         try:
@@ -364,7 +376,12 @@ class FidelityAutomation:
             return False
 
     async def _human_type(self, elem: zd.Element | None, text: str, *, clear_first: bool = False) -> bool:
-        """Focus an element via mouse click and type text with realistic human cadence and micro-delays."""
+        """Focus an element via mouse click and type text with realistic human cadence and micro-delays.
+
+        Returns:
+            True if typing succeeded, False otherwise.
+
+        """
         if not elem:
             return False
         try:
@@ -676,9 +693,8 @@ class FidelityAutomation:
                             print(f"[DEBUG] Found {len(found_options)} options from opened dropdown")
                         break
                     await asyncio.sleep(0.5)
-            else:
-                if self.debug:
-                    print("[DEBUG] Could not locate 'From' dropdown trigger on transfers page")
+            elif self.debug:
+                print("[DEBUG] Could not locate 'From' dropdown trigger on transfers page")
 
             # Flatten options if nested
             flat_options = []
@@ -865,13 +881,7 @@ class FidelityAutomation:
         }
         return True
 
-    async def login(
-        self,
-        username: str,
-        password: str,
-        totp_secret: str = "",
-        *,
-        save_device: bool = False) -> tuple[bool, bool]:
+    async def login(self, username: str, password: str, totp_secret: str = "", *, save_device: bool = False) -> tuple[bool, bool]:
         """Login to Fidelity with username and password.
 
         Optionally handles TOTP 2FA if totp_secret is provided.
@@ -888,9 +898,6 @@ class FidelityAutomation:
             (True, False) - 2FA code needed via SMS
             (False, False) - login failed
 
-        Raises:
-            Exception: If login process encounters an error.
-
         """
         try:
             # Navigate to login page
@@ -902,7 +909,10 @@ class FidelityAutomation:
             password_field = await self.page.select("#dom-pswd-input")
 
             if not username_field or not password_field:
-                raise Exception("Could not find username or password fields.")
+                print("Could not find username or password fields.")
+                if self.debug:
+                    await self.debug_screenshot("login_fields_missing")
+                return (False, False)
 
             await self._human_type(username_field, username)
             await asyncio.sleep(secrets.SystemRandom().uniform(0.2, 0.45))
@@ -932,9 +942,7 @@ class FidelityAutomation:
 
                 # Check if TOTP code field is present
                 if totp_secret and totp_secret != "NA":
-                    totp_field = await self.page.query_selector(
-                        "input[placeholder='XXXXXX'], #dom-totp-input, input[aria-label*='code' i], input[type='tel']"
-                    )
+                    totp_field = await self.page.query_selector("input[placeholder='XXXXXX'], #dom-totp-input, input[aria-label*='code' i], input[type='tel']")
                     if totp_field:
                         totp = pyotp.TOTP(totp_secret)
                         totp_code = totp.now()
@@ -1116,9 +1124,7 @@ class FidelityAutomation:
             # Select account: Wait for account dropdown to be ready
             account_dropdown = None
             for _ in range(30):  # poll up to 15 seconds
-                account_dropdown = await self.page.query_selector(
-                    "#dest-acct-dropdown, pvd-select[pvd-id*='acct' i], [data-testid*='account-select' i]"
-                )
+                account_dropdown = await self.page.query_selector("#dest-acct-dropdown, pvd-select[pvd-id*='acct' i], [data-testid*='account-select' i]")
                 if account_dropdown:
                     break
                 await asyncio.sleep(0.5)
@@ -1128,11 +1134,7 @@ class FidelityAutomation:
                 await asyncio.sleep(0.8)
 
                 # Find and click account option
-                xpath_expr = (
-                    f"//*[@role='option'][contains(normalize-space(.), '{account.upper()}')] | "
-                    f"//button[contains(normalize-space(.), '{account.upper()}')] | "
-                    f"//pvd-option[contains(normalize-space(.), '{account.upper()}')]"
-                )
+                xpath_expr = f"//*[@role='option'][contains(normalize-space(.), '{account.upper()}')] | //button[contains(normalize-space(.), '{account.upper()}')] | //pvd-option[contains(normalize-space(.), '{account.upper()}')]"
                 account_option = await self.page.xpath(xpath_expr)
                 if account_option:
                     await self._mouse_click(account_option[0])
@@ -1187,22 +1189,18 @@ class FidelityAutomation:
                     await symbol_field.send_keys(["Enter"])
                     await asyncio.sleep(secrets.SystemRandom().uniform(0.5, 0.9))
                     # Dismiss any lingering overlay by clicking neutral area
-                    try:
+                    with contextlib.suppress(Exception):
                         await self.page.mouse_click(640, 330)
-                    except Exception:
-                        pass
             else:
-                raise Exception("Could not find Symbol input field on trade ticket")
+                return (False, "Could not find Symbol input field on trade ticket")
 
             # Select action (Buy/Sell)
             action_dropdown = None
-            try:
+            with contextlib.suppress(Exception):
                 action_dropdown = await self.page.select(
                     ".eq-ticket-action-label, #dest-dropdownlist-button-action, [aria-label*='Action' i]",
                     timeout=5,
                 )
-            except Exception:
-                pass
             if not action_dropdown:
                 action_dropdown = await self._find_button("Action")
 
@@ -1211,11 +1209,7 @@ class FidelityAutomation:
                 await asyncio.sleep(0.5)
 
                 action_target = action.title()  # 'Buy' or 'Sell'
-                xpath_action = (
-                    f"//*[@role='option'][contains(normalize-space(.), '{action_target}')] | "
-                    f"//button[contains(normalize-space(.), '{action_target}')] | "
-                    f"//li[contains(normalize-space(.), '{action_target}')]"
-                )
+                xpath_action = f"//*[@role='option'][contains(normalize-space(.), '{action_target}')] | //button[contains(normalize-space(.), '{action_target}')] | //li[contains(normalize-space(.), '{action_target}')]"
                 action_opts = await self.page.xpath(xpath_action)
                 if action_opts:
                     await self._mouse_click(action_opts[0])
@@ -1250,9 +1244,7 @@ class FidelityAutomation:
 
             # Set order type
             if limit_price:
-                ordertype_btn = await self.page.query_selector(
-                    "#dest-dropdownlist-button-ordertype, #order-type-container-id"
-                )
+                ordertype_btn = await self.page.query_selector("#dest-dropdownlist-button-ordertype, #order-type-container-id")
                 if ordertype_btn:
                     await self._mouse_click(ordertype_btn)
                     await asyncio.sleep(0.5)
@@ -1273,9 +1265,7 @@ class FidelityAutomation:
                     await self._human_type(price_field, str(limit_price), clear_first=True)
             else:
                 # Market order: ensure market is chosen if a dropdown exists
-                ordertype_btn = await self.page.query_selector(
-                    "#order-type-container-id, #dest-dropdownlist-button-ordertype"
-                )
+                ordertype_btn = await self.page.query_selector("#order-type-container-id, #dest-dropdownlist-button-ordertype")
                 if ordertype_btn:
                     try:
                         btn_txt = (await ordertype_btn.apply("(el) => el ? (el.textContent || '') : ''") or "").lower()
@@ -1294,11 +1284,7 @@ class FidelityAutomation:
                 await self.debug_screenshot("trade_form_filled")
 
             if dry:
-                preview_btn = (
-                    await self._find_button("Preview order")
-                    or await self._find_button("Preview Order")
-                    or await self._find_button("Preview")
-                )
+                preview_btn = await self._find_button("Preview order") or await self._find_button("Preview Order") or await self._find_button("Preview")
                 if preview_btn:
                     await self._mouse_click(preview_btn)
                     await self.wait_for_loading_sign()
@@ -1308,9 +1294,7 @@ class FidelityAutomation:
                         await self.debug_screenshot("trade_preview_result")
 
                     # Check if error alert or modal appeared
-                    error_elem = await self.page.query_selector(
-                        ".pvd-inline-alert__content, [role='alert'], .error-message, .order-error"
-                    )
+                    error_elem = await self.page.query_selector(".pvd-inline-alert__content, [role='alert'], .error-message, .order-error")
                     if error_elem:
                         err_text = await error_elem.apply("(el) => el ? el.textContent.trim() : ''")
                         if err_text:
@@ -1320,12 +1304,7 @@ class FidelityAutomation:
                         print(f"[+] Test order preview: {action} {quantity} {stock}")
                     return (True, None)
             else:
-                submit_btn = (
-                    await self._find_button("Submit order")
-                    or await self._find_button("Place order")
-                    or await self._find_button("Submit Order")
-                    or await self._find_button("Place Order")
-                )
+                submit_btn = await self._find_button("Submit order") or await self._find_button("Place order") or await self._find_button("Submit Order") or await self._find_button("Place Order")
                 if submit_btn:
                     await self._mouse_click(submit_btn)
                     await self.wait_for_loading_sign()
@@ -1468,9 +1447,7 @@ class FidelityAutomation:
                 self.account_dict[account_num]["balance"] = round(stock["value"], 2)
             else:
                 self.account_dict[account_num]["stocks"].append(stock)
-                self.account_dict[account_num]["balance"] = round(
-                    self.account_dict[account_num].get("balance", 0.0) + stock["value"], 2
-                )
+                self.account_dict[account_num]["balance"] = round(self.account_dict[account_num].get("balance", 0.0) + stock["value"], 2)
             return True
         return False
 
@@ -1483,7 +1460,7 @@ class FidelityAutomation:
             Updated account_dict or None if an error occurs.
 
         Raises:
-            Exception: If required CSV fields are missing or other processing errors occur.
+            ValueError: If the CSV file has no headers, is empty, or is missing required columns.
 
         """
         try:
@@ -1510,15 +1487,11 @@ class FidelityAutomation:
                 # Try new UI - 3-dots kebab menu ("Available Actions")
                 actions_btn = await self._find_button("Available Actions")
                 if not actions_btn:
-                    actions_btn = await self.page.query_selector(
-                        "button[aria-label*='Available Actions' i], [data-testid*='actions' i]"
-                    )
+                    actions_btn = await self.page.query_selector("button[aria-label*='Available Actions' i], [data-testid*='actions' i]")
                 if actions_btn:
                     await self._mouse_click(actions_btn)
                     await asyncio.sleep(1.0)
-                    download_btn = await self.page.query_selector(
-                        "#kebabmenuitem-download, button[data-key='download'], button[data-menuitemtype='download']"
-                    )
+                    download_btn = await self.page.query_selector("#kebabmenuitem-download, button[data-key='download'], button[data-menuitemtype='download']")
                     if not download_btn:
                         download_btn = await self._find_button("Download")
                     if download_btn:
@@ -1553,7 +1526,7 @@ class FidelityAutomation:
                 after_files = set(cur.glob("*.csv"))
                 new_files = after_files - before_files
                 if new_files:
-                    candidate = sorted(new_files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+                    candidate = max(new_files, key=lambda p: p.stat().st_mtime)
                     if candidate.stat().st_size > 0:
                         positions_csv = candidate
                         break
@@ -1562,7 +1535,7 @@ class FidelityAutomation:
                     after_dl_files = set(downloads_dir.glob("*.csv"))
                     new_dl_files = after_dl_files - before_dl_files
                     if new_dl_files:
-                        candidate = sorted(new_dl_files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+                        candidate = max(new_dl_files, key=lambda p: p.stat().st_mtime)
                         if candidate.stat().st_size > 0:
                             positions_csv = candidate
                             break
@@ -1593,11 +1566,11 @@ class FidelityAutomation:
 
                     # Check if fieldnames exists (could be None for empty CSV)
                     if reader.fieldnames is None:
-                        raise Exception("CSV file has no headers or is empty")
+                        raise ValueError("CSV file has no headers or is empty")
 
                     intersection_set = set(reader.fieldnames).intersection(set(required_elements))
                     if len(intersection_set) != len(required_elements):
-                        raise Exception("Not enough elements in fidelity positions csv")
+                        raise ValueError("Not enough elements in fidelity positions csv")
 
                     for row in reader:
                         # Skip empty rows
@@ -1677,7 +1650,6 @@ class FidelityAutomation:
         except Exception as e:
             print(f"Error in get_account_info: {e}")
             if self.debug:
-                import traceback
                 traceback.print_exc()
             return None
 
@@ -1915,7 +1887,7 @@ def create_stock_dict(
     last_price: float,
     value: float,
     stock_list: list | None = None,
-    ) -> dict:
+) -> dict:
     """Create a dictionary for a stock. Appends it to a list if provided.
 
     Args:
@@ -1950,27 +1922,19 @@ def validate_stocks(stocks: list) -> bool:
     Returns:
         bool: True if stocks are none or valid, False if fields are left empty or types are incorrect
 
-    Raises:
-        Exception: If fields are missing or types are incorrect
-
     """
     if stocks is not None:
         for stock in stocks:
-            try:
-                if (stock["ticker"] is None or
-                    stock["quantity"] is None or
-                    stock["last_price"] is None or
-                    stock["value"] is None
-                ):
-                    raise Exception("Missing fields")
-                if (type(stock["ticker"]) is not str or
-                    type(stock["quantity"]) is not float or
-                    type(stock["last_price"]) is not float or
-                    type(stock["value"]) is not float
-                ):
-                    raise Exception("Incorrect types for entries")
-            except Exception as e:
-                print(f"Error in stocks list. {e}")
+            if stock.get("ticker") is None or stock.get("quantity") is None or stock.get("last_price") is None or stock.get("value") is None:
+                print("Error in stocks list. Missing fields")
+                print("Create list of dictionaries with the following fields populated to initialize with given list")
+                print("ticker: str")
+                print("quantity: float")
+                print("last_price: float")
+                print("value: float")
+                return False
+            if not isinstance(stock["ticker"], str) or not isinstance(stock["quantity"], float) or not isinstance(stock["last_price"], float) or not isinstance(stock["value"], float):
+                print("Error in stocks list. Incorrect types for entries")
                 print("Create list of dictionaries with the following fields populated to initialize with given list")
                 print("ticker: str")
                 print("quantity: float")

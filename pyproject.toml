@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fidelity-api"
+version = "0.0.17"
+description = "An unofficial API for Fidelity"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL"
+authors = [
+    {name = "Kenneth Tang"}
+]
+keywords = ["FIDELITY", "API"]
+dependencies = [
+    "zendriver",
+    "anyio",
+    "pyotp",
+]
+
+[tool.ruff]
+target-version = "py312"
+extend = "../ruff.toml"
+
+[tool.ruff.lint]
+ignore = [
+    "BLE001",  # Allow catching broad Exception in web automation fallback handlers
+    "T201",    # Allow print statements for logging/CLI output
+    "TRY003",  # Allow specifying messages in exceptions
+    "TRY300",  # Don't require moving return/statements into try-else blocks
+    "EM101",   # Allow string literals in exceptions
+    "S105",    # Ignore false positive for variable named totp_secret
+    "S110",    # Allow try-except-pass for optional DOM probing
+    "S112",    # Allow try-except-continue in polling loops
+    "PLR0912", # Allow branches in browser automation methods
+    "PLR0914", # Allow local variables in browser automation methods
+    "PLR0915", # Allow statements in browser automation methods
+    "PLR0904", # Allow public methods on Fidelity class
+    "PLR0911", # Allow multiple return statements for early returns
+    "PLR1702", # Allow nested blocks in UI automation
+    "PLW0717", # Allow try blocks with multiple statements
+    "PLR2004", # Allow magic values in comparisons
+    "ASYNC240",# Allow synchronous filesystem calls in async debug logging
+    "COM812",  # Avoid conflicts with ruff formatter
+    "C901",    # Allow complexity in web driver flows
+]
