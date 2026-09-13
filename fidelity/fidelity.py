@@ -242,7 +242,7 @@ class FidelityAutomation:
             (() => {{
                 const el = document.querySelector('{selector}');
                 if (!el) return 'Element {selector} not found';
-                return el.outerHTML.slice(0, 50000);
+                return el.outerHTML.slice(0, 2000000);
             }})()
             """
             content = await self.page.evaluate(js_dump)
@@ -257,12 +257,12 @@ class FidelityAutomation:
 
     async def _find_button(self, text: str, timeout: float = 5.0) -> zd.Element | None:
         """Find a button or clickable element containing the specified text."""
-        # 1. Try button/link/role='button' via xpath
+        # 1. Try button/link/role='button'/role='menuitem' via xpath
         try:
             xpath_expr = (
                 f"//button[contains(normalize-space(.), '{text}')] | "
                 f"//a[contains(normalize-space(.), '{text}')] | "
-                f"//*[@role='button'][contains(normalize-space(.), '{text}')] | "
+                f"//*[@role='button' or @role='menuitem' or @role='option'][contains(normalize-space(.), '{text}')] | "
                 f"//input[@type='submit' or @type='button'][@value='{text}']"
             )
             elems = await self.page.xpath(xpath_expr)
@@ -274,8 +274,8 @@ class FidelityAutomation:
         # 2. Try case-insensitive xpath
         try:
             xpath_expr = (
-                f"//*[self::button or self::a or @role='button']"
-                f"[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text.lower()}')]"
+                f"//*[self::button or self::a or @role='button' or @role='menuitem' or @role='option']"
+                f"[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text.lower()}')]"
             )
             elems = await self.page.xpath(xpath_expr)
             if elems:
@@ -305,10 +305,11 @@ class FidelityAutomation:
             await asyncio.sleep(secrets.SystemRandom().uniform(0.08, 0.18))
         except Exception:
             pass
+
+        # 1. Try native CDP position via zendriver get_position
         try:
             pos = await elem.get_position()
             if pos and pos.width > 0 and pos.height > 0:
-                # Add human jitter within the center 50% of the element
                 jitter_x = (secrets.SystemRandom().random() - 0.5) * (pos.width * 0.4)
                 jitter_y = (secrets.SystemRandom().random() - 0.5) * (pos.height * 0.4)
                 target_x = pos.center[0] + jitter_x
@@ -318,19 +319,49 @@ class FidelityAutomation:
                 return True
         except Exception:
             pass
+
+        # 2. Try getting coordinates via JavaScript getBoundingClientRect
+        # (Resolves positions for shadow DOM and slotted elements where CDP get_content_quads fails)
         try:
-            await elem.mouse_click()
-            await asyncio.sleep(secrets.SystemRandom().uniform(0.12, 0.28))
-            return True
-        except Exception:
-            try:
-                await elem.click()
+            rect = await elem.apply("""(el) => {
+                try {
+                    const r = el.getBoundingClientRect();
+                    return {
+                        x: r.left + r.width / 2,
+                        y: r.top + r.height / 2,
+                        width: r.width,
+                        height: r.height
+                    };
+                } catch (e) {
+                    return null;
+                }
+            }""")
+            if rect and isinstance(rect, dict) and rect.get("width", 0) > 0 and rect.get("height", 0) > 0:
+                jitter_x = (secrets.SystemRandom().random() - 0.5) * (rect["width"] * 0.4)
+                jitter_y = (secrets.SystemRandom().random() - 0.5) * (rect["height"] * 0.4)
+                target_x = rect["x"] + jitter_x
+                target_y = rect["y"] + jitter_y
+                await self.page.mouse_click(target_x, target_y)
                 await asyncio.sleep(secrets.SystemRandom().uniform(0.12, 0.28))
                 return True
-            except Exception as e:
-                if self.debug:
-                    print(f"Error clicking element: {e}")
-                return False
+        except Exception:
+            pass
+
+        # 3. Fallback to direct JavaScript click and dispatching mouse events
+        # (Bypasses flash() and get_position() entirely)
+        try:
+            await elem.apply("""(el) => {
+                el.focus();
+                el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                el.click();
+            }""")
+            await asyncio.sleep(secrets.SystemRandom().uniform(0.12, 0.28))
+            return True
+        except Exception as e:
+            if self.debug:
+                print(f"Error clicking element: {e}")
+            return False
 
     async def _human_type(self, elem: zd.Element | None, text: str, *, clear_first: bool = False) -> bool:
         """Focus an element via mouse click and type text with realistic human cadence and micro-delays."""
@@ -1075,68 +1106,229 @@ class FidelityAutomation:
                 return (False, "Action must be 'buy' or 'sell'")
 
             # Navigate to trade page
-            await self.navigate("https://digital.fidelity.com/ftgw/digital/trade-equity/index/orderEntry")
+            trade_url = "https://digital.fidelity.com/ftgw/digital/trade-equity/index/orderEntry"
+            if not self.page.url or "trade-equity" not in self.page.url:
+                await self.navigate(trade_url)
             await self.page.wait_for_ready_state("complete")
+            await self.wait_for_loading_sign()
+            await asyncio.sleep(1.0)
 
-            # Select account
-            account_dropdown = await self.page.query_selector("#dest-acct-dropdown")
-            if account_dropdown:
-                await self._mouse_click(account_dropdown)
+            # Select account: Wait for account dropdown to be ready
+            account_dropdown = None
+            for _ in range(30):  # poll up to 15 seconds
+                account_dropdown = await self.page.query_selector(
+                    "#dest-acct-dropdown, pvd-select[pvd-id*='acct' i], [data-testid*='account-select' i]"
+                )
+                if account_dropdown:
+                    break
                 await asyncio.sleep(0.5)
 
+            if account_dropdown:
+                await self._mouse_click(account_dropdown)
+                await asyncio.sleep(0.8)
+
                 # Find and click account option
-                xpath_expr = f"//button[@role='option' and contains(text(), '{account.upper()}')]"
+                xpath_expr = (
+                    f"//*[@role='option'][contains(normalize-space(.), '{account.upper()}')] | "
+                    f"//button[contains(normalize-space(.), '{account.upper()}')] | "
+                    f"//pvd-option[contains(normalize-space(.), '{account.upper()}')]"
+                )
                 account_option = await self.page.xpath(xpath_expr)
                 if account_option:
                     await self._mouse_click(account_option[0])
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(1.5)
+                else:
+                    opt = await self.page.find_element_by_text(account.upper(), best_match=True)
+                    if opt:
+                        await self._mouse_click(opt)
+                        await asyncio.sleep(1.5)
 
-            # Enter symbol
-            symbol_field = await self.page.select("input[aria-label='Symbol']")
+            # Wait for trade ticket form to load for selected account
+            await self.wait_for_loading_sign()
+            await asyncio.sleep(1.0)
+
+            # Enter symbol: try multiple selectors
+            symbol_field = None
+            symbol_selectors = [
+                "input[aria-label='Symbol']",
+                "#eq-ticket-dest-symbol",
+                "input[aria-label*='Symbol' i]",
+                "input[placeholder*='Symbol' i]",
+                "input[name*='symbol' i]",
+                "#eq-ticket__symbol-box input",
+                "input[id*='symbol' i]",
+            ]
+            for _ in range(15):  # poll up to 7.5 seconds
+                for sel in symbol_selectors:
+                    try:
+                        symbol_field = await self.page.query_selector(sel)
+                        if symbol_field:
+                            break
+                    except Exception:
+                        continue
+                if symbol_field:
+                    break
+                await asyncio.sleep(0.5)
+
+            if not symbol_field:
+                symbol_field = await self._find_button("Symbol")
+
             if symbol_field:
-                await self._human_type(symbol_field, stock)
-                await symbol_field.send_keys(["Enter"])
-                await asyncio.sleep(secrets.SystemRandom().uniform(0.8, 1.4))
+                await self._human_type(symbol_field, stock, clear_first=True)
+                await asyncio.sleep(0.8)
+
+                # Look for suggestion overlay matching ticker
+                xpath_sug = f"//*[@role='option'][contains(normalize-space(.), '{stock.upper()}')]"
+                sug_opts = await self.page.xpath(xpath_sug)
+                if sug_opts:
+                    await self._mouse_click(sug_opts[0])
+                    await asyncio.sleep(0.5)
+                else:
+                    await symbol_field.send_keys(["Enter"])
+                    await asyncio.sleep(secrets.SystemRandom().uniform(0.5, 0.9))
+                    # Dismiss any lingering overlay by clicking neutral area
+                    try:
+                        await self.page.mouse_click(640, 330)
+                    except Exception:
+                        pass
+            else:
+                raise Exception("Could not find Symbol input field on trade ticket")
 
             # Select action (Buy/Sell)
-            action_dropdown = await self.page.select(".eq-ticket-action-label")
+            action_dropdown = None
+            try:
+                action_dropdown = await self.page.select(
+                    ".eq-ticket-action-label, #dest-dropdownlist-button-action, [aria-label*='Action' i]",
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            if not action_dropdown:
+                action_dropdown = await self._find_button("Action")
+
             if action_dropdown:
                 await self._mouse_click(action_dropdown)
-                action_option = await self.page.select(f"option[value='{action}']")
-                if action_option:
-                    await self._mouse_click(action_option)
+                await asyncio.sleep(0.5)
+
+                action_target = action.title()  # 'Buy' or 'Sell'
+                xpath_action = (
+                    f"//*[@role='option'][contains(normalize-space(.), '{action_target}')] | "
+                    f"//button[contains(normalize-space(.), '{action_target}')] | "
+                    f"//li[contains(normalize-space(.), '{action_target}')]"
+                )
+                action_opts = await self.page.xpath(xpath_action)
+                if action_opts:
+                    await self._mouse_click(action_opts[0])
+                    await asyncio.sleep(0.5)
+                else:
+                    opt = await self.page.find_element_by_text(action_target, best_match=True)
+                    if opt:
+                        await self._mouse_click(opt)
+                        await asyncio.sleep(0.5)
 
             # Enter quantity
-            qty_field = await self.page.select("input[aria-label='Quantity']")
+            qty_field = None
+            qty_selectors = [
+                "#eqt-mts-stock-quatity input",
+                "input[aria-label='Quantity']",
+                "input[aria-label*='Quantity' i]",
+                "input[placeholder*='Quantity' i]",
+                "input[name*='quantity' i]",
+                "#eq-ticket__quantity-box input",
+            ]
+            for sel in qty_selectors:
+                try:
+                    qty_field = await self.page.query_selector(sel)
+                    if qty_field:
+                        break
+                except Exception:
+                    continue
+
             if qty_field:
-                await self._human_type(qty_field, str(quantity))
+                await self._human_type(qty_field, str(quantity), clear_first=True)
+                await asyncio.sleep(0.5)
 
             # Set order type
             if limit_price:
+                ordertype_btn = await self.page.query_selector(
+                    "#dest-dropdownlist-button-ordertype, #order-type-container-id"
+                )
+                if ordertype_btn:
+                    await self._mouse_click(ordertype_btn)
+                    await asyncio.sleep(0.5)
                 order_type = await self._find_button("Limit")
                 if order_type:
                     await self._mouse_click(order_type)
+                    await asyncio.sleep(0.5)
 
-                    price_field = await self.page.select("input[aria-label='Limit Price']")
-                    if price_field:
-                        await self._human_type(price_field, str(limit_price))
+                price_field = None
+                for sel in ["input[aria-label*='Limit' i]", "#eqt-mts-limit-price input", "input[name*='limit' i]"]:
+                    try:
+                        price_field = await self.page.query_selector(sel)
+                        if price_field:
+                            break
+                    except Exception:
+                        continue
+                if price_field:
+                    await self._human_type(price_field, str(limit_price), clear_first=True)
+            else:
+                # Market order: ensure market is chosen if a dropdown exists
+                ordertype_btn = await self.page.query_selector(
+                    "#order-type-container-id, #dest-dropdownlist-button-ordertype"
+                )
+                if ordertype_btn:
+                    try:
+                        btn_txt = (await ordertype_btn.apply("(el) => el ? (el.textContent || '') : ''") or "").lower()
+                        if "market" not in btn_txt:
+                            await self._mouse_click(ordertype_btn)
+                            await asyncio.sleep(0.5)
+                            mkt_opt = await self._find_button("Market")
+                            if mkt_opt:
+                                await self._mouse_click(mkt_opt)
+                                await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
 
             # Review order (or place if dry)
             if self.debug:
                 await self.debug_screenshot("trade_form_filled")
 
             if dry:
-                preview_btn = await self._find_button("Preview Order")
+                preview_btn = (
+                    await self._find_button("Preview order")
+                    or await self._find_button("Preview Order")
+                    or await self._find_button("Preview")
+                )
                 if preview_btn:
                     await self._mouse_click(preview_btn)
-                    await asyncio.sleep(1)
+                    await self.wait_for_loading_sign()
+                    await asyncio.sleep(2)
+
+                    if self.debug:
+                        await self.debug_screenshot("trade_preview_result")
+
+                    # Check if error alert or modal appeared
+                    error_elem = await self.page.query_selector(
+                        ".pvd-inline-alert__content, [role='alert'], .error-message, .order-error"
+                    )
+                    if error_elem:
+                        err_text = await error_elem.apply("(el) => el ? el.textContent.trim() : ''")
+                        if err_text:
+                            return (False, f"Preview failed: {err_text}")
+
                     if self.debug:
                         print(f"[+] Test order preview: {action} {quantity} {stock}")
                     return (True, None)
             else:
-                submit_btn = await self._find_button("Submit Order")
+                submit_btn = (
+                    await self._find_button("Submit order")
+                    or await self._find_button("Place order")
+                    or await self._find_button("Submit Order")
+                    or await self._find_button("Place Order")
+                )
                 if submit_btn:
                     await self._mouse_click(submit_btn)
+                    await self.wait_for_loading_sign()
                     await asyncio.sleep(2)
                     if self.debug:
                         print(f"[+] Order submitted: {action} {quantity} {stock}")
@@ -1151,6 +1343,9 @@ class FidelityAutomation:
         except Exception as e:
             error_msg = f"Transaction error: {e!s}"
             print(error_msg)
+            if self.debug:
+                await self.debug_screenshot("trade_error")
+                await self.debug_dump_dom("trade_error")
             traceback.print_exc()
             return (False, error_msg)
 
@@ -1254,7 +1449,7 @@ class FidelityAutomation:
             traceback.print_exc()
             return False
 
-    async def add_stock_to_account_dict(self, account_num: str, stock: dict, *, overwrite: bool = False) -> bool:
+    def add_stock_to_account_dict(self, account_num: str, stock: dict, *, overwrite: bool = False) -> bool:
         """Add a stock to the account dict under an account. You can use/import `create_stock_dict` for help.
 
         Returns
@@ -1268,12 +1463,14 @@ class FidelityAutomation:
         if not validate_stocks([stock]):
             return False
         if account_num in self.account_dict:
-            if overwrite:
+            if "stocks" not in self.account_dict[account_num] or overwrite:
                 self.account_dict[account_num]["stocks"] = [stock]
                 self.account_dict[account_num]["balance"] = round(stock["value"], 2)
             else:
                 self.account_dict[account_num]["stocks"].append(stock)
-                self.account_dict[account_num]["balance"] += round(stock["value"], 2)
+                self.account_dict[account_num]["balance"] = round(
+                    self.account_dict[account_num].get("balance", 0.0) + stock["value"], 2
+                )
             return True
         return False
 
@@ -1305,22 +1502,39 @@ class FidelityAutomation:
 
             # Record CSV files before click
             before_files = set(cur.glob("*.csv"))
+            downloads_dir = Path.home() / "Downloads"
+            before_dl_files = set(downloads_dir.glob("*.csv")) if downloads_dir.exists() else set()
 
             new_ui = True
             try:
-                # Try new UI
+                # Try new UI - 3-dots kebab menu ("Available Actions")
                 actions_btn = await self._find_button("Available Actions")
+                if not actions_btn:
+                    actions_btn = await self.page.query_selector(
+                        "button[aria-label*='Available Actions' i], [data-testid*='actions' i]"
+                    )
                 if actions_btn:
                     await self._mouse_click(actions_btn)
-                    await asyncio.sleep(0.5)
-                    download_btn = await self._find_button("Download")
+                    await asyncio.sleep(1.0)
+                    download_btn = await self.page.query_selector(
+                        "#kebabmenuitem-download, button[data-key='download'], button[data-menuitemtype='download']"
+                    )
+                    if not download_btn:
+                        download_btn = await self._find_button("Download")
                     if download_btn:
                         await self._mouse_click(download_btn)
                     else:
-                        new_ui = False
+                        # Direct JS click trigger fallback
+                        await self.page.evaluate("""() => {
+                            const b = document.querySelector('#kebabmenuitem-download, [data-key="download"]');
+                            if (b) { b.click(); return true; }
+                            return false;
+                        }""")
                 else:
                     new_ui = False
-            except Exception:
+            except Exception as e:
+                if self.debug:
+                    self.debug_log(f"New UI download error: {e}")
                 new_ui = False
 
             if not new_ui:
@@ -1329,28 +1543,29 @@ class FidelityAutomation:
                     download_btn = await self.page.select('*[aria-label="Download Positions"]', timeout=8)
                     if download_btn:
                         await self._mouse_click(download_btn)
-                    else:
-                        print("Could not get positions csv")
-                        if self.debug:
-                            await self.debug_screenshot("positions_failed")
-                            await self.debug_dump_dom("positions_failed")
-                        return None
                 except Exception:
-                    print("Could not get positions csv")
-                    if self.debug:
-                        await self.debug_screenshot("positions_failed")
-                        await self.debug_dump_dom("positions_failed")
-                    return None
+                    pass
 
-            # Wait for downloaded CSV file
+            # Wait for downloaded CSV file (check both cur and user Downloads directory)
             positions_csv = None
-            for _ in range(20):  # wait up to 10 seconds
+            for _ in range(30):  # wait up to 15 seconds
                 await asyncio.sleep(0.5)
                 after_files = set(cur.glob("*.csv"))
                 new_files = after_files - before_files
                 if new_files:
-                    positions_csv = next(iter(new_files))
-                    break
+                    candidate = sorted(new_files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+                    if candidate.stat().st_size > 0:
+                        positions_csv = candidate
+                        break
+
+                if downloads_dir.exists():
+                    after_dl_files = set(downloads_dir.glob("*.csv"))
+                    new_dl_files = after_dl_files - before_dl_files
+                    if new_dl_files:
+                        candidate = sorted(new_dl_files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+                        if candidate.stat().st_size > 0:
+                            positions_csv = candidate
+                            break
 
             if not positions_csv or not positions_csv.exists():
                 print("Could not get positions csv")
