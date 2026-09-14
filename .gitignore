@@ -1,6 +1,6 @@
 *.sh
 *.bat
-*hometest.py
+*home*.py
 *TestSession/
 fidelity_debug*
 .debug_artifacts/
